@@ -68,8 +68,11 @@ document.addEventListener("DOMContentLoaded", function () {
       if (!overlay) {
         overlay = document.createElement("div");
         overlay.className = "md-typeset code-overlay";
+        var wrapper = document.createElement("div");
+        wrapper.className = container.className;
         var clone = pre.cloneNode(true);
-        overlay.appendChild(clone);
+        wrapper.appendChild(clone);
+        overlay.appendChild(wrapper);
         document.body.appendChild(overlay);
         overlay.addEventListener("click", function () {
           overlay.remove();
