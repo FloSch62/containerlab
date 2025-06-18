@@ -351,3 +351,15 @@ div.highlight.code-scroll-sm pre>code {
 [dir="ltr"] .md-typeset blockquote {
   border-left: .1rem solid var(--md-default-fg-color--lightest);
 }
+/* START expandable code block styles */
+.md-typeset pre.md-code--expanded {
+  position: relative;
+  max-width: none;
+  width: calc(100vw - 2rem);
+  left: 50%;
+  transform: translateX(-50%);
+}
+.md-typeset .md-code__button[data-md-type="expand"] {
+  right: 2.6rem;
+}
+/* END expandable code block styles */
