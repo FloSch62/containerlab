@@ -11,7 +11,6 @@ document.addEventListener("DOMContentLoaded", function () {
     btn.className = "md-code__button md-icon";
     btn.type = "button";
     btn.dataset.mdType = "expand";
-    btn.dataset.mdSvgIcon = "material:arrow-expand";
     btn.title = "Expand code";
     if (copyBtn) {
       copyBtn.after(btn);
@@ -20,9 +19,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
     btn.addEventListener("click", function () {
       var expanded = pre.classList.toggle("md-code--expanded");
-      btn.dataset.mdSvgIcon = expanded
-        ? "material:arrow-collapse"
-        : "material:arrow-expand";
+      btn.dataset.mdType = expanded ? "collapse" : "expand";
       var label = expanded ? "Collapse code" : "Expand code";
       btn.title = label;
     });
