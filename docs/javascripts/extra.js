@@ -67,7 +67,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var overlay = document.querySelector(".code-overlay");
       if (!overlay) {
         overlay = document.createElement("div");
-        overlay.className = "md-typeset code-overlay";
+        overlay.className = container.className + " md-typeset code-overlay";
         var clone = pre.cloneNode(true);
         overlay.appendChild(clone);
         document.body.appendChild(overlay);
