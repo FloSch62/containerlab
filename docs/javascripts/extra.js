@@ -64,12 +64,34 @@ document.addEventListener("DOMContentLoaded", function () {
     btn.addEventListener("blur", hideTooltip);
 
     btn.addEventListener("click", function () {
-      var expanded = pre.classList.toggle("md-code--expanded");
-      btn.dataset.mdType = expanded ? "collapse" : "expand";
-      var label = expanded ? "Collapse code" : "Expand code";
-      btn.title = label;
-      inner.textContent = label;
-      showTooltip();
+      var overlay = document.querySelector(".code-overlay");
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.className = "md-typeset code-overlay";
+        var clone = pre.cloneNode(true);
+        overlay.appendChild(clone);
+        document.body.appendChild(overlay);
+        overlay.addEventListener("click", function () {
+          overlay.remove();
+          btn.dataset.mdType = "expand";
+          var label = "Expand code";
+          btn.title = label;
+          inner.textContent = label;
+          showTooltip();
+        });
+        btn.dataset.mdType = "collapse";
+        var label = "Collapse code";
+        btn.title = label;
+        inner.textContent = label;
+        showTooltip();
+      } else {
+        overlay.remove();
+        btn.dataset.mdType = "expand";
+        var label = "Expand code";
+        btn.title = label;
+        inner.textContent = label;
+        showTooltip();
+      }
     });
   });
 });

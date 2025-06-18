@@ -351,14 +351,26 @@ div.highlight.code-scroll-sm pre>code {
 [dir="ltr"] .md-typeset blockquote {
   border-left: .1rem solid var(--md-default-fg-color--lightest);
 }
-/* START expandable code block styles */
-.md-typeset pre.md-code--expanded {
-  position: relative;
-  max-width: none;
-  width: calc(100vw - 2rem);
-  left: 50%;
-  transform: translateX(-50%);
+/* START overlay code block styles */
+.code-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
 }
+
+.code-overlay pre {
+  max-width: 90%;
+  max-height: 90%;
+  overflow: auto;
+}
+
 .md-typeset .md-code__button[data-md-type="expand"] {
   right: 2.6rem;
 }
@@ -370,4 +382,4 @@ div.highlight.code-scroll-sm pre>code {
 .md-typeset .md-code__button[data-md-type="collapse"]::after {
   mask-image: url('data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20viewBox%3D%270%200%2024%2024%27%3E%3Cpath%20d%3D%27M19.5%203.09%2015%207.59V4h-2v7h7V9h-3.59l4.5-4.5zM4%2013v2h3.59l-4.5%204.5%201.41%201.41%204.5-4.5V20h2v-7z%27/%3E%3C/svg%3E');
 }
-/* END expandable code block styles */
+/* END overlay code block styles */
