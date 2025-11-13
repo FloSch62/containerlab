@@ -56,6 +56,7 @@ func GetOptions() *Options {
 				Format:                "plain",
 				IncludeInterfaceStats: false,
 				StatsInterval:         time.Second,
+				WebsocketBuffer:       16,
 			},
 			ToolsAPI: &ToolsApiOptions{
 				Image:          "ghcr.io/srl-labs/clab-api-server/clab-api-server:latest",
@@ -364,6 +365,8 @@ type EventsOptions struct {
 	IncludeInitialState   bool
 	IncludeInterfaceStats bool
 	StatsInterval         time.Duration
+	WebsocketListen       string
+	WebsocketBuffer       int
 }
 
 type ToolsApiOptions struct {

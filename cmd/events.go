@@ -8,10 +8,9 @@ import (
 
 func eventsCmd(o *Options) (*cobra.Command, error) {
 	c := &cobra.Command{
-		Use:   "events",
-		Short: "stream lab lifecycle and interface events",
-		Long: "stream container runtime events and interface updates for all running labs using the selected runtime\n" +
-			"reference: https://containerlab.dev/cmd/events/",
+		Use:     "events",
+		Short:   "stream lab lifecycle and interface events",
+		Long:    "stream container runtime events and interface updates for all running labs using the selected runtime\n" + "reference: https://containerlab.dev/cmd/events/",
 		Aliases: []string{"ev"},
 		PreRunE: func(*cobra.Command, []string) error {
 			return clabutils.CheckAndGetRootPrivs()
@@ -51,6 +50,20 @@ func eventsCmd(o *Options) (*cobra.Command, error) {
 		"interval between interface statistics samples (requires --interface-stats)",
 	)
 
+	c.Flags().StringVar(
+		&o.Events.WebsocketListen,
+		"websocket-listen",
+		o.Events.WebsocketListen,
+		"serve events via WebSocket on the provided address (for example 0.0.0.0:8081)",
+	)
+
+	c.Flags().IntVar(
+		&o.Events.WebsocketBuffer,
+		"websocket-buffer",
+		o.Events.WebsocketBuffer,
+		"per-connection buffer for pending events before disconnecting slow consumers",
+	)
+
 	c.Example = `# Stream container and interface events in plain text
 containerlab events
 
@@ -69,6 +82,21 @@ func eventsFn(cmd *cobra.Command, o *Options) error {
 		StatsInterval:         o.Events.StatsInterval,
 		ClabOptions:           o.ToClabOptions(),
 		Writer:                cmd.OutOrStdout(),
+	}
+
+	if o.Events.WebsocketListen != "" {
+		socketOpts := opts
+		socketOpts.Writer = nil
+		socketOpts.Sink = nil
+		socketOpts.Format = "json"
+
+		server := &clabevents.WebSocketServer{
+			Address: o.Events.WebsocketListen,
+			Buffer:  o.Events.WebsocketBuffer,
+			Options: socketOpts,
+		}
+
+		return server.Listen(cmd.Context())
 	}
 
 	return clabevents.Stream(cmd.Context(), opts)

@@ -15,24 +15,79 @@ import (
 )
 
 // Stream subscribes to the selected runtime and netlink sources and forwards
-// aggregated events to the configured writer.
+// aggregated events to the configured sink. When no sink is provided the
+// default writer sink renders events to the CLI.
 func Stream(ctx context.Context, opts Options) error {
-	ctx, cancel := context.WithCancel(ctx)
+	sink, err := opts.sink()
+	if err != nil {
+		return err
+	}
+
+	events, runtimeErrors, cancel, err := StreamChannel(ctx, opts)
+	if err != nil {
+		return err
+	}
 	defer cancel()
+
+	sinkErrs := make(chan error, 1)
+	go func() {
+		sinkErrs <- sink.Consume(ctx, events)
+		close(sinkErrs)
+	}()
+
+	for sinkErrs != nil || runtimeErrors != nil {
+		select {
+		case err, ok := <-runtimeErrors:
+			if !ok {
+				runtimeErrors = nil
+
+				continue
+			}
+
+			if err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+		case err, ok := <-sinkErrs:
+			if !ok {
+				sinkErrs = nil
+
+				continue
+			}
+
+			if err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// StreamChannel configures the event sources and returns the aggregated event
+// channel along with the runtime error stream. Callers should invoke the
+// returned cancel function when they are done consuming events.
+func StreamChannel(
+	ctx context.Context,
+	opts Options,
+) (<-chan aggregatedEvent, <-chan error, context.CancelFunc, error) {
+	ctx, cancel := context.WithCancel(ctx)
+
+	cleanup := cancel
 
 	clab, err := clabcore.NewContainerLab(opts.ClabOptions...)
 	if err != nil {
-		return err
+		cleanup()
+
+		return nil, nil, func() {}, err
 	}
 
 	runtime, ok := clab.Runtimes[opts.Runtime]
 	if !ok {
-		return fmt.Errorf("runtime %q is not initialized", opts.Runtime)
-	}
+		cleanup()
 
-	printer, err := newFormatter(opts.Format, opts.writer())
-	if err != nil {
-		return err
+		return nil, nil, func() {}, fmt.Errorf("runtime %q is not initialized", opts.Runtime)
 	}
 
 	eventCh := make(chan aggregatedEvent, 128)
@@ -46,7 +101,9 @@ func Stream(ctx context.Context, opts Options) error {
 
 	containers, err := clab.ListContainers(ctx, clabcore.WithListclabLabelExists())
 	if err != nil {
-		return fmt.Errorf("failed to list containers: %w", err)
+		cleanup()
+
+		return nil, nil, func() {}, fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	if opts.IncludeInitialState {
@@ -70,34 +127,15 @@ func Stream(ctx context.Context, opts Options) error {
 
 	runtimeEvents, runtimeErrs, err := runtime.StreamEvents(ctx, streamOpts)
 	if err != nil {
-		return fmt.Errorf("failed to stream events for runtime %q: %w", opts.Runtime, err)
+		cleanup()
+
+		return nil, nil, func() {}, fmt.Errorf("failed to stream events for runtime %q: %w", opts.Runtime, err)
 	}
 
 	errCh := make(chan error, 1)
 	go forwardRuntimeEvents(ctx, runtime, registry, runtimeEvents, runtimeErrs, eventCh, errCh)
 
-	runtimeErrors := errCh
-
-	for {
-		select {
-		case ev := <-eventCh:
-			if err := printer(ev); err != nil {
-				log.Debugf("failed to write event: %v", err)
-			}
-		case err, ok := <-runtimeErrors:
-			if !ok {
-				runtimeErrors = nil
-
-				continue
-			}
-
-			if err != nil && !errors.Is(err, context.Canceled) {
-				return err
-			}
-		case <-ctx.Done():
-			return nil
-		}
-	}
+	return eventCh, errCh, cleanup, nil
 }
 
 func forwardRuntimeEvents(

@@ -16,6 +16,7 @@ type Options struct {
 	StatsInterval         time.Duration
 	ClabOptions           []clabcore.ClabOption
 	Writer                io.Writer
+	Sink                  EventSink
 }
 
 func (o Options) writer() io.Writer {
@@ -24,4 +25,12 @@ func (o Options) writer() io.Writer {
 	}
 
 	return io.Discard
+}
+
+func (o Options) sink() (EventSink, error) {
+	if o.Sink != nil {
+		return o.Sink, nil
+	}
+
+	return NewWriterSink(o.Format, o.writer())
 }
