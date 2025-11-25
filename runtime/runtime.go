@@ -87,6 +87,22 @@ type ContainerRuntime interface {
 	InspectImage(ctx context.Context, imageName string) (*ImageInspect, error)
 }
 
+// TopologyDeployer is an optional interface that runtimes can implement
+// to support batch deployment of nodes and links as a single transaction.
+// This is useful for runtimes like CX that need to apply all resources together.
+type TopologyDeployer interface {
+	// AddLink adds a link to the pending batch for later deployment.
+	AddLink(endpoints [2]LinkEndpoint)
+	// ApplyTopology applies all pending nodes and links as a single transaction.
+	ApplyTopology(ctx context.Context) error
+}
+
+// LinkEndpoint represents one side of a link for topology deployment.
+type LinkEndpoint struct {
+	Node      string
+	Interface string
+}
+
 type ContainerStatus string
 
 const (

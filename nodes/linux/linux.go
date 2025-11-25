@@ -14,6 +14,7 @@ import (
 	clabconstants "github.com/srl-labs/containerlab/constants"
 	clabnodes "github.com/srl-labs/containerlab/nodes"
 	clabnodesstate "github.com/srl-labs/containerlab/nodes/state"
+	clabruntime "github.com/srl-labs/containerlab/runtime"
 	clabruntimeignite "github.com/srl-labs/containerlab/runtime/ignite"
 	clabtypes "github.com/srl-labs/containerlab/types"
 	clabutils "github.com/srl-labs/containerlab/utils"
@@ -78,6 +79,53 @@ func (n *linux) Deploy(ctx context.Context, _ *clabnodes.DeployParams) error {
 	if err != nil {
 		return err
 	}
+
+	// If runtime supports batch topology deployment, add this node's links
+	if td, ok := n.Runtime.(clabruntime.TopologyDeployer); ok {
+		for _, ep := range n.GetEndpoints() {
+			link := ep.GetLink()
+			if link == nil {
+				continue
+			}
+
+			endpoints := link.GetEndpoints()
+			if len(endpoints) != 2 {
+				continue
+			}
+
+			epA := endpoints[0]
+			epB := endpoints[1]
+
+			nodeA := epA.GetNode()
+			nodeB := epB.GetNode()
+			if nodeA == nil || nodeB == nil {
+				continue
+			}
+
+			nodeAName := nodeA.GetShortName()
+			nodeBName := nodeB.GetShortName()
+
+			// Only add the link from the alphabetically first node to avoid duplicates
+			if n.Cfg.ShortName != nodeAName && n.Cfg.ShortName != nodeBName {
+				continue
+			}
+			if nodeAName > nodeBName {
+				if n.Cfg.ShortName == nodeBName {
+					continue
+				}
+			} else if n.Cfg.ShortName != nodeAName {
+				continue
+			}
+
+			log.Infof("Node %s: adding link %s:%s <-> %s:%s",
+				n.Cfg.ShortName, nodeAName, epA.GetIfaceName(), nodeBName, epB.GetIfaceName())
+			td.AddLink([2]clabruntime.LinkEndpoint{
+				{Node: nodeAName, Interface: epA.GetIfaceName()},
+				{Node: nodeBName, Interface: epB.GetIfaceName()},
+			})
+		}
+	}
+
 	intf, err := n.Runtime.StartContainer(ctx, cID, n)
 
 	if vmChans, ok := intf.(*operations.VMChannels); ok {

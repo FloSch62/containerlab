@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/log"
-	"sigs.k8s.io/yaml"
+	goyaml "gopkg.in/yaml.v3"
 )
 
 // SimLinkEndpoint represents one side of a SimLink.
@@ -27,16 +27,14 @@ type SimLinkSpec struct {
 	EndpointB SimLinkEndpoint
 }
 
-// CreateSimLink creates a SimLink CRD connecting two SimNode interfaces.
-func (c *CXRuntime) CreateSimLink(ctx context.Context, link SimLinkSpec) error {
+// buildSimLinkManifest builds a SimLink manifest without applying it.
+func (c *CXRuntime) buildSimLinkManifest(link SimLinkSpec) map[string]interface{} {
 	// Generate a unique name for the SimLink
 	// Format: <nodeA>-<ifaceA>-<nodeB>-<ifaceB>
 	linkName := fmt.Sprintf("%s-%s-%s-%s",
 		link.EndpointA.Node, sanitizeInterfaceName(link.EndpointA.Interface),
 		link.EndpointB.Node, sanitizeInterfaceName(link.EndpointB.Interface))
 	linkName = strings.ToLower(linkName)
-
-	log.Infof("Creating SimLink: %s", linkName)
 
 	// Generate interface resource names
 	// Format: <node>-<interface>
@@ -47,7 +45,7 @@ func (c *CXRuntime) CreateSimLink(ctx context.Context, link SimLinkSpec) error {
 
 	// Build the SimLink manifest
 	// SimLink connects two SimNodes using local and sim sections
-	simLink := map[string]interface{}{
+	return map[string]interface{}{
 		"apiVersion": "core.eda.nokia.com/v1",
 		"kind":       "SimLink",
 		"metadata": map[string]interface{}{
@@ -75,11 +73,31 @@ func (c *CXRuntime) CreateSimLink(ctx context.Context, link SimLinkSpec) error {
 			},
 		},
 	}
+}
 
-	manifest, err := yaml.Marshal(simLink)
-	if err != nil {
+// AddSimLink adds a SimLink manifest to pending manifests for batch apply.
+func (c *CXRuntime) AddSimLink(link SimLinkSpec) {
+	simLink := c.buildSimLinkManifest(link)
+	linkName := simLink["metadata"].(map[string]interface{})["name"].(string)
+	log.Infof("Adding SimLink to batch: %s", linkName)
+	c.addPendingManifest(simLink)
+}
+
+// CreateSimLink creates a SimLink CRD connecting two SimNode interfaces (direct apply).
+func (c *CXRuntime) CreateSimLink(ctx context.Context, link SimLinkSpec) error {
+	simLink := c.buildSimLinkManifest(link)
+	linkName := simLink["metadata"].(map[string]interface{})["name"].(string)
+
+	log.Infof("Creating SimLink: %s", linkName)
+
+	var buf bytes.Buffer
+	encoder := goyaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(simLink); err != nil {
 		return fmt.Errorf("failed to marshal SimLink: %w", err)
 	}
+	encoder.Close()
+	manifest := buf.Bytes()
 
 	log.Debugf("SimLink manifest:\n%s", string(manifest))
 
@@ -122,20 +140,78 @@ func (c *CXRuntime) DeleteSimLinksForLab(ctx context.Context) error {
 
 	log.Infof("Deleting SimLinks for lab: %s", c.labName)
 
+	// First get the list of SimLinks for this lab
 	selector := fmt.Sprintf("clab-lab-name=%s", c.labName)
-	cmd := exec.CommandContext(ctx, "kubectl",
+	listCmd := exec.CommandContext(ctx, "kubectl",
 		"-n", c.topoNamespace,
-		"delete", "simlink",
+		"get", "simlink",
 		"-l", selector,
-		"--ignore-not-found",
+		"-o", "jsonpath={.items[*].metadata.name}",
 	)
-
-	output, err := cmd.CombinedOutput()
+	output, err := listCmd.Output()
 	if err != nil {
-		return fmt.Errorf("failed to delete SimLinks for lab %s: %w, output: %s", c.labName, err, string(output))
+		log.Debugf("No SimLinks found for lab %s", c.labName)
+		return nil
 	}
 
-	log.Debugf("SimLinks deleted: %s", string(output))
+	simLinkNames := strings.Fields(string(output))
+	if len(simLinkNames) == 0 {
+		log.Debug("No SimLinks to delete")
+		return nil
+	}
+
+	// Try to use edactl for deletion to keep state in sync
+	toolboxPod, err := c.getToolboxPodName(ctx)
+	if err != nil {
+		// Fallback to kubectl if toolbox not found
+		log.Warnf("Toolbox not found, using kubectl delete: %v", err)
+		cmd := exec.CommandContext(ctx, "kubectl",
+			"-n", c.topoNamespace,
+			"delete", "simlink",
+			"-l", selector,
+			"--ignore-not-found",
+		)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to delete SimLinks for lab %s: %w, output: %s", c.labName, err, string(output))
+		}
+		log.Debugf("SimLinks deleted: %s", string(output))
+		return nil
+	}
+
+	// Delete each SimLink via edactl using file-based delete
+	for _, name := range simLinkNames {
+		log.Debugf("Deleting SimLink via edactl: %s", name)
+
+		deleteYAML := fmt.Sprintf(`apiVersion: core.eda.nokia.com/v1
+kind: SimLink
+metadata:
+  name: %s
+  namespace: %s
+`, name, c.topoNamespace)
+
+		remotePath := fmt.Sprintf("/tmp/clab-delete-simlink-%s.yaml", name)
+		writeCmd := exec.CommandContext(ctx, "kubectl", "exec", "-i", "-n", c.coreNamespace, toolboxPod,
+			"--", "bash", "-c", fmt.Sprintf("cat > %s", remotePath))
+		writeCmd.Stdin = strings.NewReader(deleteYAML)
+		if output, err := writeCmd.CombinedOutput(); err != nil {
+			log.Warnf("Failed to write delete file: %v, output: %s", err, string(output))
+			continue
+		}
+
+		deleteCmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", c.coreNamespace, toolboxPod,
+			"--", "edactl", "delete", "-f", remotePath)
+		if output, err := deleteCmd.CombinedOutput(); err != nil {
+			log.Warnf("edactl delete simlink %s failed: %v, output: %s", name, err, string(output))
+		}
+
+		// Cleanup
+		cleanupCmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", c.coreNamespace, toolboxPod,
+			"--", "rm", "-f", remotePath)
+		_ = cleanupCmd.Run()
+	}
+
+	log.Debugf("SimLinks deleted for lab: %s", c.labName)
 	return nil
 }
 

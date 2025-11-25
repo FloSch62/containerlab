@@ -10,15 +10,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/log"
 	clabexec "github.com/srl-labs/containerlab/exec"
 	clabruntime "github.com/srl-labs/containerlab/runtime"
 	clabtypes "github.com/srl-labs/containerlab/types"
-	"sigs.k8s.io/yaml"
+	goyaml "gopkg.in/yaml.v3"
 )
 
 const (
@@ -60,6 +63,18 @@ type CXRuntime struct {
 	topoNamespace string
 	coreNamespace string
 	labName       string
+
+	// Manifest collection for batch apply via edactl
+	manifestsMu       sync.Mutex
+	pendingManifests  []map[string]interface{}
+	manifestsApplied  bool
+	expectedNodeCount int
+	createdNodeCount  int
+
+	// Synchronization for topology apply
+	applyOnce     sync.Once
+	applyErr      error
+	applyComplete chan struct{}
 }
 
 func (c *CXRuntime) Init(opts ...clabruntime.RuntimeOption) error {
@@ -67,6 +82,7 @@ func (c *CXRuntime) Init(opts ...clabruntime.RuntimeOption) error {
 
 	c.topoNamespace = defaultTopoNamespace
 	c.coreNamespace = defaultCoreNamespace
+	c.applyComplete = make(chan struct{})
 
 	for _, o := range opts {
 		o(c)
@@ -118,7 +134,7 @@ func (c *CXRuntime) PullImage(ctx context.Context, imageName string, pullPolicy 
 	return nil
 }
 
-// CreateContainer creates a SimNode CRD in EDA.
+// CreateContainer collects SimNode manifests for batch apply via edactl.
 func (c *CXRuntime) CreateContainer(ctx context.Context, node *clabtypes.NodeConfig) (string, error) {
 	log.Info("Creating SimNode", "name", node.ShortName)
 
@@ -131,24 +147,39 @@ func (c *CXRuntime) CreateContainer(ctx context.Context, node *clabtypes.NodeCon
 
 	simNode := c.buildSimNode(node)
 
-	manifest, err := yaml.Marshal(simNode)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal SimNode: %w", err)
-	}
+	// Add to pending manifests for batch apply
+	c.addPendingManifest(simNode)
 
-	log.Debugf("SimNode manifest:\n%s", string(manifest))
+	c.manifestsMu.Lock()
+	c.createdNodeCount++
+	c.manifestsMu.Unlock()
 
-	if err := c.applyManifest(ctx, manifest); err != nil {
-		return "", fmt.Errorf("failed to create SimNode %s: %w", node.ShortName, err)
-	}
+	log.Debugf("SimNode %s added to pending manifests (total: %d)", node.ShortName, c.createdNodeCount)
 
 	return node.ShortName, nil
 }
 
 // StartContainer waits for the SimNode pod to be ready.
+// On first call, it applies all pending SimNodes and SimLinks via edactl.
 func (c *CXRuntime) StartContainer(ctx context.Context, cID string, node clabruntime.Node) (any, error) {
 	nodeCfg := node.Config()
 	log.Debugf("Starting SimNode: %s", nodeCfg.ShortName)
+
+	// Apply topology on first StartContainer call (sync.Once ensures only one apply)
+	c.applyOnce.Do(func() {
+		// Small delay to allow concurrent nodes to finish adding their manifests
+		time.Sleep(500 * time.Millisecond)
+
+		log.Info("CX runtime: applying topology via edactl")
+		c.applyErr = c.applyAllManifestsViaEdactl(ctx)
+		close(c.applyComplete)
+	})
+
+	// Wait for topology apply to complete
+	<-c.applyComplete
+	if c.applyErr != nil {
+		return nil, fmt.Errorf("failed to apply topology: %w", c.applyErr)
+	}
 
 	// Check if this is a cEOS image that needs bootstrapping
 	isCeos := IsCeosImage(nodeCfg.Image)
@@ -177,72 +208,36 @@ func (c *CXRuntime) StartContainer(ctx context.Context, cID string, node clabrun
 		nodeCfg.MgmtIPv4Address = ip
 	}
 
-	// Create SimLinks for this node's endpoints
-	// We create the SimLink from this node's perspective; kubectl apply is idempotent
-	// so creating the same link twice (from both endpoints) is fine
-	for _, ep := range node.GetEndpoints() {
-		link := ep.GetLink()
-		if link == nil {
-			continue
-		}
-
-		endpoints := link.GetEndpoints()
-		if len(endpoints) != 2 {
-			log.Warnf("Link has %d endpoints, expected 2", len(endpoints))
-			continue
-		}
-
-		// Get the node names from the endpoints
-		epA := endpoints[0]
-		epB := endpoints[1]
-
-		// Only create link if this node is the "first" endpoint (alphabetically)
-		// This avoids duplicate creation attempts
-		nodeA := epA.GetNode()
-		nodeB := epB.GetNode()
-		if nodeA == nil || nodeB == nil {
-			log.Warnf("Link endpoint has nil node")
-			continue
-		}
-
-		nodeAName := nodeA.GetShortName()
-		nodeBName := nodeB.GetShortName()
-
-		// Only create the link from the alphabetically first node
-		if nodeCfg.ShortName != nodeAName && nodeCfg.ShortName != nodeBName {
-			continue
-		}
-		if nodeAName > nodeBName {
-			// Swap so we always process from the "first" node
-			if nodeCfg.ShortName == nodeBName {
-				continue // Let the other node create it
-			}
-		} else {
-			if nodeCfg.ShortName == nodeAName {
-				// We're the first node, create the link
-			} else {
-				continue // Let the other node create it
-			}
-		}
-
-		simLink := SimLinkSpec{
-			EndpointA: SimLinkEndpoint{
-				Node:      nodeAName,
-				Interface: epA.GetIfaceName(),
-			},
-			EndpointB: SimLinkEndpoint{
-				Node:      nodeBName,
-				Interface: epB.GetIfaceName(),
-			},
-		}
-
-		if err := c.CreateSimLink(ctx, simLink); err != nil {
-			log.Warnf("Failed to create SimLink for %s: %v", nodeCfg.ShortName, err)
-			// Continue with other links, don't fail the whole deployment
-		}
-	}
-
 	return nil, nil
+}
+
+// AddLinks adds all SimLink manifests to pending for batch apply.
+func (c *CXRuntime) AddLinks(links []SimLinkSpec) {
+	for _, link := range links {
+		c.AddSimLink(link)
+	}
+}
+
+// AddLink implements the TopologyDeployer interface.
+// It adds a link to the pending batch for later deployment.
+func (c *CXRuntime) AddLink(endpoints [2]clabruntime.LinkEndpoint) {
+	link := SimLinkSpec{
+		EndpointA: SimLinkEndpoint{
+			Node:      endpoints[0].Node,
+			Interface: endpoints[0].Interface,
+		},
+		EndpointB: SimLinkEndpoint{
+			Node:      endpoints[1].Node,
+			Interface: endpoints[1].Interface,
+		},
+	}
+	c.AddSimLink(link)
+}
+
+// ApplyTopology applies all pending SimNode and SimLink manifests via edactl.
+// This implements the TopologyDeployer interface.
+func (c *CXRuntime) ApplyTopology(ctx context.Context) error {
+	return c.applyAllManifestsViaEdactl(ctx)
 }
 
 // StopContainer is a no-op for CX runtime (container lifecycle managed by K8s).
@@ -441,17 +436,64 @@ func (c *CXRuntime) DeleteContainer(ctx context.Context, cID string) error {
 
 	log.Infof("Deleting SimNode: %s", simNodeName)
 
-	args := []string{
-		"-n", c.topoNamespace,
-		"delete", "simnode", simNodeName,
-		"--ignore-not-found",
+	// Use edactl delete to keep internal state in sync
+	toolboxPod, err := c.getToolboxPodName(ctx)
+	if err != nil {
+		// Fallback to kubectl if toolbox not found
+		log.Warnf("Toolbox not found, using kubectl delete: %v", err)
+		args := []string{
+			"-n", c.topoNamespace,
+			"delete", "simnode", simNodeName,
+			"--ignore-not-found",
+		}
+		cmd := exec.CommandContext(ctx, "kubectl", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to delete SimNode %s: %w, output: %s", simNodeName, err, string(output))
+		}
+		log.Info("Deleted SimNode", "name", simNodeName)
+		return nil
 	}
 
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to delete SimNode %s: %w, output: %s", simNodeName, err, string(output))
+	// Delete via edactl using file-based delete
+	deleteYAML := fmt.Sprintf(`apiVersion: core.eda.nokia.com/v1
+kind: SimNode
+metadata:
+  name: %s
+  namespace: %s
+`, simNodeName, c.topoNamespace)
+
+	// Write to temp file on toolbox and delete
+	remotePath := fmt.Sprintf("/tmp/clab-delete-%s.yaml", simNodeName)
+	writeCmd := exec.CommandContext(ctx, "kubectl", "exec", "-i", "-n", c.coreNamespace, toolboxPod,
+		"--", "bash", "-c", fmt.Sprintf("cat > %s", remotePath))
+	writeCmd.Stdin = strings.NewReader(deleteYAML)
+	if output, err := writeCmd.CombinedOutput(); err != nil {
+		log.Warnf("Failed to write delete file: %v, output: %s", err, string(output))
 	}
+
+	deleteCmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", c.coreNamespace, toolboxPod,
+		"--", "edactl", "delete", "-f", remotePath)
+	output, err := deleteCmd.CombinedOutput()
+	if err != nil {
+		// If edactl delete fails, try kubectl as fallback
+		log.Warnf("edactl delete failed, trying kubectl: %v, output: %s", err, string(output))
+		args := []string{
+			"-n", c.topoNamespace,
+			"delete", "simnode", simNodeName,
+			"--ignore-not-found",
+		}
+		cmd := exec.CommandContext(ctx, "kubectl", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to delete SimNode %s: %w, output: %s", simNodeName, err, string(output))
+		}
+	}
+
+	// Cleanup remote file
+	cleanupCmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", c.coreNamespace, toolboxPod,
+		"--", "rm", "-f", remotePath)
+	_ = cleanupCmd.Run()
 
 	log.Info("Deleted SimNode", "name", simNodeName)
 	return nil
@@ -588,8 +630,13 @@ func (c *CXRuntime) buildSimNode(node *clabtypes.NodeConfig) map[string]interfac
 
 	// Add containerlab labels
 	// Labels with values containing invalid K8s characters go to annotations instead
+	// Skip empty values as Kubernetes doesn't allow empty label values
 	if node.Labels != nil {
 		for k, v := range node.Labels {
+			if v == "" {
+				// Skip empty values
+				continue
+			}
 			if strings.ContainsAny(v, "/\\:") {
 				// Put path-like values in annotations (no character restrictions)
 				annotations[k] = v
@@ -639,6 +686,115 @@ func (c *CXRuntime) applyManifest(ctx context.Context, manifest []byte) error {
 	}
 
 	log.Debugf("kubectl apply output: %s", string(output))
+	return nil
+}
+
+// SetExpectedNodeCount sets the expected number of nodes for batch apply.
+func (c *CXRuntime) SetExpectedNodeCount(count int) {
+	c.manifestsMu.Lock()
+	defer c.manifestsMu.Unlock()
+	c.expectedNodeCount = count
+	log.Debugf("CX runtime: expecting %d nodes", count)
+}
+
+// addPendingManifest adds a manifest to the pending list for batch apply.
+func (c *CXRuntime) addPendingManifest(manifest map[string]interface{}) {
+	c.manifestsMu.Lock()
+	defer c.manifestsMu.Unlock()
+	c.pendingManifests = append(c.pendingManifests, manifest)
+}
+
+// getToolboxPodName finds the EDA toolbox pod name.
+func (c *CXRuntime) getToolboxPodName(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", c.coreNamespace,
+		"-l", "eda.nokia.com/app=eda-toolbox",
+		"-o", "jsonpath={.items[0].metadata.name}")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to find toolbox pod: %w", err)
+	}
+	podName := strings.TrimSpace(string(output))
+	if podName == "" {
+		return "", fmt.Errorf("toolbox pod not found")
+	}
+	return podName, nil
+}
+
+// applyAllManifestsViaEdactl applies all pending manifests as a single transaction via edactl.
+func (c *CXRuntime) applyAllManifestsViaEdactl(ctx context.Context) error {
+	c.manifestsMu.Lock()
+	if c.manifestsApplied {
+		c.manifestsMu.Unlock()
+		return nil
+	}
+	manifests := c.pendingManifests
+	c.manifestsApplied = true
+	c.manifestsMu.Unlock()
+
+	if len(manifests) == 0 {
+		log.Debug("CX runtime: no manifests to apply")
+		return nil
+	}
+
+	log.Infof("CX runtime: applying %d manifests via edactl", len(manifests))
+
+	// Build a single YAML document with all manifests
+	// Use gopkg.in/yaml.v3 for proper indentation (edactl requires properly indented arrays)
+	var yamlDocs []string
+	for _, m := range manifests {
+		var buf bytes.Buffer
+		encoder := goyaml.NewEncoder(&buf)
+		encoder.SetIndent(2)
+		if err := encoder.Encode(m); err != nil {
+			return fmt.Errorf("failed to marshal manifest: %w", err)
+		}
+		encoder.Close()
+		yamlDocs = append(yamlDocs, strings.TrimSpace(buf.String()))
+	}
+	combinedYAML := strings.Join(yamlDocs, "\n---\n")
+
+	log.Debugf("Combined manifest:\n%s", combinedYAML)
+
+	// Create a temp file with the combined manifests
+	tmpDir := os.TempDir()
+	manifestFile := filepath.Join(tmpDir, fmt.Sprintf("clab-%s-manifests.yaml", c.labName))
+	if err := os.WriteFile(manifestFile, []byte(combinedYAML), 0644); err != nil {
+		return fmt.Errorf("failed to write manifest file: %w", err)
+	}
+	defer os.Remove(manifestFile)
+
+	// Find the toolbox pod
+	toolboxPod, err := c.getToolboxPodName(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to find toolbox pod: %w", err)
+	}
+
+	log.Infof("Using toolbox pod: %s", toolboxPod)
+
+	// Copy the manifest file to the toolbox pod
+	remotePath := fmt.Sprintf("/tmp/clab-%s-manifests.yaml", c.labName)
+	copyCmd := exec.CommandContext(ctx, "kubectl", "cp", manifestFile,
+		fmt.Sprintf("%s/%s:%s", c.coreNamespace, toolboxPod, remotePath))
+	if output, err := copyCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to copy manifest to toolbox: %w, output: %s", err, string(output))
+	}
+
+	// Apply via edactl on the toolbox pod
+	// Note: don't pass -n flag since namespace is already in the manifests
+	applyCmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", c.coreNamespace, toolboxPod,
+		"--", "edactl", "apply", "-f", remotePath)
+	output, err := applyCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("edactl apply failed: %w, output: %s", err, string(output))
+	}
+
+	log.Infof("edactl apply output: %s", string(output))
+
+	// Cleanup the remote file
+	cleanupCmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", c.coreNamespace, toolboxPod,
+		"--", "rm", "-f", remotePath)
+	_ = cleanupCmd.Run() // Ignore cleanup errors
+
 	return nil
 }
 

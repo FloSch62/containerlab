@@ -158,6 +158,60 @@ func (d *DefaultNode) Deploy(ctx context.Context, _ *DeployParams) error {
 		return err
 	}
 
+	// If runtime supports batch topology deployment, add this node's links
+	log.Debugf("Node %s: runtime type is %T, checking for TopologyDeployer", d.Cfg.ShortName, d.Runtime)
+	if td, ok := d.Runtime.(clabruntime.TopologyDeployer); ok {
+		log.Infof("Node %s: runtime supports TopologyDeployer, checking %d endpoints", d.Cfg.ShortName, len(d.GetEndpoints()))
+		for _, ep := range d.GetEndpoints() {
+			link := ep.GetLink()
+			if link == nil {
+				log.Debugf("Node %s: endpoint has nil link", d.Cfg.ShortName)
+				continue
+			}
+
+			endpoints := link.GetEndpoints()
+			if len(endpoints) != 2 {
+				log.Debugf("Node %s: link has %d endpoints, expected 2", d.Cfg.ShortName, len(endpoints))
+				continue
+			}
+
+			epA := endpoints[0]
+			epB := endpoints[1]
+
+			nodeA := epA.GetNode()
+			nodeB := epB.GetNode()
+			if nodeA == nil || nodeB == nil {
+				log.Debugf("Node %s: endpoint has nil node", d.Cfg.ShortName)
+				continue
+			}
+
+			nodeAName := nodeA.GetShortName()
+			nodeBName := nodeB.GetShortName()
+
+			// Only add the link from the alphabetically first node to avoid duplicates
+			if d.Cfg.ShortName != nodeAName && d.Cfg.ShortName != nodeBName {
+				log.Debugf("Node %s: not part of link %s <-> %s", d.Cfg.ShortName, nodeAName, nodeBName)
+				continue
+			}
+			if nodeAName > nodeBName {
+				if d.Cfg.ShortName == nodeBName {
+					log.Debugf("Node %s: skipping link (not alphabetically first)", d.Cfg.ShortName)
+					continue
+				}
+			} else if d.Cfg.ShortName != nodeAName {
+				log.Debugf("Node %s: skipping link (not alphabetically first)", d.Cfg.ShortName)
+				continue
+			}
+
+			log.Infof("Node %s: adding link %s:%s <-> %s:%s",
+				d.Cfg.ShortName, nodeAName, epA.GetIfaceName(), nodeBName, epB.GetIfaceName())
+			td.AddLink([2]clabruntime.LinkEndpoint{
+				{Node: nodeAName, Interface: epA.GetIfaceName()},
+				{Node: nodeBName, Interface: epB.GetIfaceName()},
+			})
+		}
+	}
+
 	// start the container
 	_, err = d.Runtime.StartContainer(ctx, cID, d)
 	if err != nil {

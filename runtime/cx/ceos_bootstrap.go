@@ -118,9 +118,11 @@ func IsCeosImage(image string) bool {
 // BootstrapCeos performs the necessary setup for cEOS containers in EDA.
 // This includes:
 // 1. Creating the if-wait ConfigMap
-// 2. Patching the deployment with the proper command, volumes, and env vars
-// 3. Waiting for the pod to be ready
-// 4. Configuring admin credentials
+// 2. Waiting for the deployment to be created by the SimNode controller
+// 3. Patching the deployment with the proper command, volumes, and env vars
+// 4. Waiting for the pod to be ready
+// 5. Configuring admin credentials
+// 6. Restarting linked peer pods so their cxdp reconnects
 func (c *CXRuntime) BootstrapCeos(ctx context.Context, simNodeName string) error {
 	log.Infof("Bootstrapping cEOS for SimNode %s", simNodeName)
 
@@ -131,19 +133,32 @@ func (c *CXRuntime) BootstrapCeos(ctx context.Context, simNodeName string) error
 		return fmt.Errorf("failed to create cEOS ConfigMap: %w", err)
 	}
 
-	// Step 2: Patch the deployment
+	// Step 2: Wait for the deployment to be created by the SimNode controller
+	if err := c.waitForDeploymentExists(ctx, deploymentName); err != nil {
+		return fmt.Errorf("failed waiting for deployment to exist: %w", err)
+	}
+
+	// Step 3: Patch the deployment
 	if err := c.patchCeosDeployment(ctx, deploymentName, simNodeName); err != nil {
 		return fmt.Errorf("failed to patch cEOS deployment: %w", err)
 	}
 
-	// Step 3: Wait for rollout
+	// Step 4: Wait for rollout
 	if err := c.waitForDeploymentRollout(ctx, deploymentName); err != nil {
 		return fmt.Errorf("failed to wait for deployment rollout: %w", err)
 	}
 
-	// Step 4: Configure admin credentials
+	// Step 5: Configure admin credentials
 	if err := c.configureCeosAdmin(ctx, simNodeName); err != nil {
 		return fmt.Errorf("failed to configure cEOS admin: %w", err)
+	}
+
+	// Step 6: Restart linked peer pods so their cxdp can reconnect
+	// The cEOS bootstrap causes the pod to restart, which breaks existing
+	// cxdp connections. We need to restart peers so they reconnect.
+	if err := c.restartLinkedPeers(ctx, simNodeName); err != nil {
+		log.Warnf("Failed to restart linked peers for %s: %v", simNodeName, err)
+		// Don't fail the bootstrap - connectivity might still work
 	}
 
 	log.Infof("cEOS bootstrap completed for %s", simNodeName)
@@ -261,6 +276,28 @@ func (c *CXRuntime) patchDeployment(ctx context.Context, deploymentName, patch s
 	return nil
 }
 
+func (c *CXRuntime) waitForDeploymentExists(ctx context.Context, deploymentName string) error {
+	log.Debugf("Waiting for deployment %s to be created", deploymentName)
+
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		cmd := exec.CommandContext(ctx, "kubectl",
+			"get", "deployment", deploymentName,
+			"-n", c.coreNamespace,
+			"-o", "name",
+		)
+
+		if output, err := cmd.CombinedOutput(); err == nil {
+			log.Debugf("Deployment found: %s", strings.TrimSpace(string(output)))
+			return nil
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+
+	return fmt.Errorf("timed out waiting for deployment %s to be created", deploymentName)
+}
+
 func (c *CXRuntime) waitForDeploymentRollout(ctx context.Context, deploymentName string) error {
 	log.Debugf("Waiting for deployment %s rollout", deploymentName)
 
@@ -317,4 +354,86 @@ write memory
 	}
 
 	return fmt.Errorf("timed out configuring cEOS admin credentials")
+}
+
+// restartLinkedPeers finds all SimLinks involving the given node and restarts
+// the peer deployments so their cxdp can establish new connections.
+func (c *CXRuntime) restartLinkedPeers(ctx context.Context, nodeName string) error {
+	log.Debugf("Finding linked peers for %s", nodeName)
+
+	// Get all SimLinks in the namespace
+	cmd := exec.CommandContext(ctx, "kubectl",
+		"get", "simlinks",
+		"-n", c.topoNamespace,
+		"-o", "jsonpath={range .items[*]}{.metadata.name},{.spec.links[0].local.node},{.spec.links[0].sim.node}{\"\\n\"}{end}",
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get SimLinks: %w", err)
+	}
+
+	// Find peers linked to this node
+	peers := make(map[string]bool)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		if len(parts) != 3 {
+			continue
+		}
+		localNode := parts[1]
+		simNode := parts[2]
+
+		if localNode == nodeName && simNode != nodeName {
+			peers[simNode] = true
+		}
+		if simNode == nodeName && localNode != nodeName {
+			peers[localNode] = true
+		}
+	}
+
+	if len(peers) == 0 {
+		log.Debug("No linked peers found")
+		return nil
+	}
+
+	// Restart each peer deployment
+	timestamp := time.Now().Format(time.RFC3339)
+	for peer := range peers {
+		log.Infof("Restarting linked peer deployment: %s", peer)
+		deploymentName := fmt.Sprintf("cx-eda--%s-sim", peer)
+
+		// Use annotation patch to trigger pod restart
+		annotationPatch := fmt.Sprintf(
+			`{"spec":{"template":{"metadata":{"annotations":{"clab-restart-trigger":"%s"}}}}}`,
+			timestamp,
+		)
+
+		restartCmd := exec.CommandContext(ctx, "kubectl",
+			"patch", "deployment", deploymentName,
+			"-n", c.coreNamespace,
+			"--type=merge",
+			"-p", annotationPatch,
+		)
+
+		if output, err := restartCmd.CombinedOutput(); err != nil {
+			log.Warnf("Failed to restart peer %s: %v, output: %s", peer, err, string(output))
+			continue
+		}
+
+		// Wait for the deployment to roll out
+		waitCmd := exec.CommandContext(ctx, "kubectl",
+			"rollout", "status", "deployment", deploymentName,
+			"-n", c.coreNamespace,
+			"--timeout=120s",
+		)
+		if output, err := waitCmd.CombinedOutput(); err != nil {
+			log.Warnf("Failed to wait for peer %s rollout: %v, output: %s", peer, err, string(output))
+		}
+	}
+
+	return nil
 }
