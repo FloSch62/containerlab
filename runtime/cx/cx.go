@@ -33,6 +33,18 @@ const (
 	simTopologyKey = "eda.nokia.com/simtopology"
 )
 
+// extractShortName extracts the short SimNode name from a containerlab long name.
+// Long name format: clab-<labname>-<nodename> -> returns <nodename>
+// If it's already a short name, returns it unchanged.
+func extractShortName(cID string) string {
+	parts := strings.Split(cID, "-")
+	if len(parts) > 3 && parts[0] == "clab" {
+		// Long name format: clab-<labname>-<nodename>
+		return parts[len(parts)-1]
+	}
+	return cID
+}
+
 func init() {
 	clabruntime.Register(RuntimeName, func() clabruntime.ContainerRuntime {
 		return &CXRuntime{
@@ -112,7 +124,7 @@ func (c *CXRuntime) CreateContainer(ctx context.Context, node *clabtypes.NodeCon
 
 	// Store lab name for later use
 	if c.labName == "" && node.Labels != nil {
-		if labName, ok := node.Labels["clab-topo"]; ok {
+		if labName, ok := node.Labels["containerlab"]; ok {
 			c.labName = labName
 		}
 	}
@@ -138,6 +150,17 @@ func (c *CXRuntime) StartContainer(ctx context.Context, cID string, node clabrun
 	nodeCfg := node.Config()
 	log.Debugf("Starting SimNode: %s", nodeCfg.ShortName)
 
+	// Check if this is a cEOS image that needs bootstrapping
+	isCeos := IsCeosImage(nodeCfg.Image)
+	if isCeos {
+		log.Infof("Detected cEOS image for %s, applying bootstrap patches first", nodeCfg.ShortName)
+		// For cEOS, we must apply bootstrap patches BEFORE the pod can start
+		// The cEOS image has no ENTRYPOINT/CMD and needs special setup
+		if err := c.BootstrapCeos(ctx, nodeCfg.ShortName); err != nil {
+			return nil, fmt.Errorf("failed to bootstrap cEOS for %s: %w", nodeCfg.ShortName, err)
+		}
+	}
+
 	// Wait for the pod to be ready
 	podName, err := c.waitForSimPod(ctx, nodeCfg.ShortName)
 	if err != nil {
@@ -152,6 +175,71 @@ func (c *CXRuntime) StartContainer(ctx context.Context, cID string, node clabrun
 		log.Warnf("Failed to get IP for SimNode %s: %v", nodeCfg.ShortName, err)
 	} else {
 		nodeCfg.MgmtIPv4Address = ip
+	}
+
+	// Create SimLinks for this node's endpoints
+	// We create the SimLink from this node's perspective; kubectl apply is idempotent
+	// so creating the same link twice (from both endpoints) is fine
+	for _, ep := range node.GetEndpoints() {
+		link := ep.GetLink()
+		if link == nil {
+			continue
+		}
+
+		endpoints := link.GetEndpoints()
+		if len(endpoints) != 2 {
+			log.Warnf("Link has %d endpoints, expected 2", len(endpoints))
+			continue
+		}
+
+		// Get the node names from the endpoints
+		epA := endpoints[0]
+		epB := endpoints[1]
+
+		// Only create link if this node is the "first" endpoint (alphabetically)
+		// This avoids duplicate creation attempts
+		nodeA := epA.GetNode()
+		nodeB := epB.GetNode()
+		if nodeA == nil || nodeB == nil {
+			log.Warnf("Link endpoint has nil node")
+			continue
+		}
+
+		nodeAName := nodeA.GetShortName()
+		nodeBName := nodeB.GetShortName()
+
+		// Only create the link from the alphabetically first node
+		if nodeCfg.ShortName != nodeAName && nodeCfg.ShortName != nodeBName {
+			continue
+		}
+		if nodeAName > nodeBName {
+			// Swap so we always process from the "first" node
+			if nodeCfg.ShortName == nodeBName {
+				continue // Let the other node create it
+			}
+		} else {
+			if nodeCfg.ShortName == nodeAName {
+				// We're the first node, create the link
+			} else {
+				continue // Let the other node create it
+			}
+		}
+
+		simLink := SimLinkSpec{
+			EndpointA: SimLinkEndpoint{
+				Node:      nodeAName,
+				Interface: epA.GetIfaceName(),
+			},
+			EndpointB: SimLinkEndpoint{
+				Node:      nodeBName,
+				Interface: epB.GetIfaceName(),
+			},
+		}
+
+		if err := c.CreateSimLink(ctx, simLink); err != nil {
+			log.Warnf("Failed to create SimLink for %s: %v", nodeCfg.ShortName, err)
+			// Continue with other links, don't fail the whole deployment
+		}
 	}
 
 	return nil, nil
@@ -241,8 +329,11 @@ func (c *CXRuntime) ListContainers(ctx context.Context, gfilters []*clabtypes.Ge
 
 // GetNSPath returns the network namespace path for a container.
 func (c *CXRuntime) GetNSPath(ctx context.Context, cID string) (string, error) {
+	// Extract the short SimNode name from the long containerlab name
+	shortName := extractShortName(cID)
+
 	// Get the pod name for this SimNode
-	podName, err := c.getPodName(ctx, cID)
+	podName, err := c.getPodName(ctx, shortName)
 	if err != nil {
 		return "", err
 	}
@@ -258,7 +349,10 @@ func (c *CXRuntime) GetNSPath(ctx context.Context, cID string) (string, error) {
 
 // Exec executes a command inside the SimNode pod.
 func (c *CXRuntime) Exec(ctx context.Context, cID string, execCmd *clabexec.ExecCmd) (*clabexec.ExecResult, error) {
-	podName, err := c.getPodName(ctx, cID)
+	// Extract the short SimNode name from the long containerlab name
+	shortName := extractShortName(cID)
+
+	podName, err := c.getPodName(ctx, shortName)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +360,7 @@ func (c *CXRuntime) Exec(ctx context.Context, cID string, execCmd *clabexec.Exec
 	args := []string{
 		"-n", c.coreNamespace,
 		"exec", podName,
-		"-c", cID,
+		"-c", shortName,
 		"--",
 	}
 	args = append(args, execCmd.GetCmd()...)
@@ -297,7 +391,10 @@ func (c *CXRuntime) Exec(ctx context.Context, cID string, execCmd *clabexec.Exec
 
 // ExecNotWait executes a command without waiting for output.
 func (c *CXRuntime) ExecNotWait(ctx context.Context, cID string, execCmd *clabexec.ExecCmd) error {
-	podName, err := c.getPodName(ctx, cID)
+	// Extract the short SimNode name from the long containerlab name
+	shortName := extractShortName(cID)
+
+	podName, err := c.getPodName(ctx, shortName)
 	if err != nil {
 		return err
 	}
@@ -305,7 +402,7 @@ func (c *CXRuntime) ExecNotWait(ctx context.Context, cID string, execCmd *clabex
 	args := []string{
 		"-n", c.coreNamespace,
 		"exec", podName,
-		"-c", cID,
+		"-c", shortName,
 		"--",
 	}
 	args = append(args, execCmd.GetCmd()...)
@@ -314,7 +411,7 @@ func (c *CXRuntime) ExecNotWait(ctx context.Context, cID string, execCmd *clabex
 	return cmd.Start()
 }
 
-// DeleteContainer deletes the SimNode CRD.
+// DeleteContainer deletes the SimNode CRD and associated SimLinks.
 func (c *CXRuntime) DeleteContainer(ctx context.Context, cID string) error {
 	// The cID is typically the long name (e.g., clab-cx-multitool-server1)
 	// but our SimNode uses the short name (e.g., server1)
@@ -324,6 +421,22 @@ func (c *CXRuntime) DeleteContainer(ctx context.Context, cID string) error {
 	if len(parts) > 3 {
 		// Long name format: clab-<labname>-<nodename>
 		simNodeName = parts[len(parts)-1]
+	}
+
+	// Try to get the lab name from the SimNode's labels if not already set
+	if c.labName == "" {
+		if simNode, err := c.getSimNodeByName(ctx, simNodeName); err == nil {
+			if labName, ok := simNode.Labels["containerlab"]; ok {
+				c.labName = labName
+			}
+		}
+	}
+
+	// Delete SimLinks for this lab (only once, on first node deletion)
+	// Using label selector ensures we only delete our lab's SimLinks
+	if err := c.DeleteSimLinksForLab(ctx); err != nil {
+		log.Warnf("Failed to delete SimLinks: %v", err)
+		// Continue with SimNode deletion
 	}
 
 	log.Infof("Deleting SimNode: %s", simNodeName)
@@ -376,7 +489,8 @@ func (c *CXRuntime) GetContainerStatus(ctx context.Context, cID string) clabrunt
 
 // IsHealthy checks if the SimNode pod is healthy.
 func (c *CXRuntime) IsHealthy(ctx context.Context, cID string) (bool, error) {
-	podName, err := c.getPodName(ctx, cID)
+	shortName := extractShortName(cID)
+	podName, err := c.getPodName(ctx, shortName)
 	if err != nil {
 		return false, err
 	}
@@ -422,7 +536,8 @@ func (c *CXRuntime) GetCooCBindMounts() clabtypes.Binds {
 
 // StreamLogs streams logs from the SimNode pod.
 func (c *CXRuntime) StreamLogs(ctx context.Context, containerName string) (io.ReadCloser, error) {
-	podName, err := c.getPodName(ctx, containerName)
+	shortName := extractShortName(containerName)
+	podName, err := c.getPodName(ctx, shortName)
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +545,7 @@ func (c *CXRuntime) StreamLogs(ctx context.Context, containerName string) (io.Re
 	args := []string{
 		"-n", c.coreNamespace,
 		"logs", "-f", podName,
-		"-c", containerName,
+		"-c", shortName,
 	}
 
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
