@@ -153,12 +153,25 @@ func (c *CXRuntime) BootstrapCeos(ctx context.Context, simNodeName string) error
 		return fmt.Errorf("failed to configure cEOS admin: %w", err)
 	}
 
-	// Step 6: Restart linked peer pods so their cxdp can reconnect
+	// Step 6: Configure iptables to allow cxdp IPC ports
+	// cEOS has strict iptables rules that block ports 50123 and 50128 by default
+	if err := c.configureCeosIptables(ctx, simNodeName); err != nil {
+		log.Warnf("Failed to configure cEOS iptables: %v", err)
+		// Don't fail - try to continue
+	}
+
+	// Step 7: Restart linked peer pods so their cxdp can reconnect
 	// The cEOS bootstrap causes the pod to restart, which breaks existing
 	// cxdp connections. We need to restart peers so they reconnect.
 	if err := c.restartLinkedPeers(ctx, simNodeName); err != nil {
 		log.Warnf("Failed to restart linked peers for %s: %v", simNodeName, err)
 		// Don't fail the bootstrap - connectivity might still work
+	}
+
+	// Step 8: Ensure dataplane interfaces are up on all linked nodes
+	// After pod restarts, the -cx veth interfaces may be DOWN
+	if err := c.ensureDataplaneInterfacesUp(ctx, simNodeName); err != nil {
+		log.Warnf("Failed to bring up dataplane interfaces: %v", err)
 	}
 
 	log.Infof("cEOS bootstrap completed for %s", simNodeName)
@@ -356,6 +369,40 @@ write memory
 	return fmt.Errorf("timed out configuring cEOS admin credentials")
 }
 
+// configureCeosIptables adds iptables rules to allow cxdp IPC ports.
+// cEOS has strict iptables rules with default DROP policy that block the
+// cxdp inter-node communication ports (50123 and 50128).
+func (c *CXRuntime) configureCeosIptables(ctx context.Context, simNodeName string) error {
+	log.Debugf("Configuring iptables for cxdp IPC ports on %s", simNodeName)
+
+	podName, err := c.getPodName(ctx, simNodeName)
+	if err != nil {
+		return err
+	}
+
+	// Ports used by cxdp for inter-node communication
+	cxdpPorts := []string{"50123", "50128"}
+
+	for _, port := range cxdpPorts {
+		cmd := exec.CommandContext(ctx, "kubectl",
+			"-n", c.coreNamespace,
+			"exec", podName,
+			"-c", simNodeName,
+			"--",
+			"iptables", "-I", "EOS_INPUT", "1", "-p", "tcp", "--dport", port, "-j", "ACCEPT",
+		)
+
+		if output, err := cmd.CombinedOutput(); err != nil {
+			log.Warnf("Failed to add iptables rule for port %s: %v, output: %s", port, err, string(output))
+			// Continue trying other ports
+		} else {
+			log.Debugf("Added iptables rule to allow TCP port %s", port)
+		}
+	}
+
+	return nil
+}
+
 // restartLinkedPeers finds all SimLinks involving the given node and restarts
 // the peer deployments so their cxdp can establish new connections.
 func (c *CXRuntime) restartLinkedPeers(ctx context.Context, nodeName string) error {
@@ -436,4 +483,118 @@ func (c *CXRuntime) restartLinkedPeers(ctx context.Context, nodeName string) err
 	}
 
 	return nil
+}
+
+// ensureDataplaneInterfacesUp brings up the -cx veth interfaces on all linked nodes.
+// After pod restarts, these interfaces may be in DOWN state which breaks connectivity.
+func (c *CXRuntime) ensureDataplaneInterfacesUp(ctx context.Context, nodeName string) error {
+	log.Infof("Ensuring dataplane interfaces are up for %s and its peers", nodeName)
+
+	// Wait a bit for cxdp to create the interfaces after pod restart
+	time.Sleep(5 * time.Second)
+
+	// Get all SimLinks in the namespace
+	cmd := exec.CommandContext(ctx, "kubectl",
+		"get", "simlinks",
+		"-n", c.topoNamespace,
+		"-o", "jsonpath={range .items[*]}{.metadata.name},{.spec.links[0].local.node},{.spec.links[0].local.interface},{.spec.links[0].sim.node},{.spec.links[0].sim.interface}{\"\\n\"}{end}",
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get SimLinks: %w", err)
+	}
+
+	// Process each link involving this node
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		if len(parts) != 5 {
+			continue
+		}
+		localNode := parts[1]
+		localIface := parts[2]
+		simNode := parts[3]
+		simIface := parts[4]
+
+		// Check if this link involves our node
+		if localNode != nodeName && simNode != nodeName {
+			continue
+		}
+
+		// Bring up interfaces on both sides of the link
+		// Local side
+		if err := c.bringUpCxInterface(ctx, localNode, localIface); err != nil {
+			log.Warnf("Failed to bring up %s:%s-cx: %v", localNode, localIface, err)
+		}
+
+		// Sim side
+		if err := c.bringUpCxInterface(ctx, simNode, simIface); err != nil {
+			log.Warnf("Failed to bring up %s:%s-cx: %v", simNode, simIface, err)
+		}
+	}
+
+	return nil
+}
+
+// bringUpCxInterface brings up both the main interface and the -cx veth interface
+func (c *CXRuntime) bringUpCxInterface(ctx context.Context, nodeName, ifaceName string) error {
+	// Get the pod name for this node
+	podName, err := c.getPodNameForNode(ctx, nodeName)
+	if err != nil {
+		return fmt.Errorf("failed to get pod for node %s: %w", nodeName, err)
+	}
+
+	// Interface names
+	cxIfaceName := ifaceName + "-cx"
+
+	log.Debugf("Bringing up interfaces %s and %s on pod %s", ifaceName, cxIfaceName, podName)
+
+	// Bring up the main interface first
+	bringUpMainCmd := exec.CommandContext(ctx, "kubectl",
+		"exec", "-n", c.coreNamespace, podName,
+		"-c", nodeName,
+		"--", "ip", "link", "set", ifaceName, "up",
+	)
+	if output, err := bringUpMainCmd.CombinedOutput(); err != nil {
+		log.Debugf("Failed to bring up %s (may not exist yet): %v, output: %s", ifaceName, err, string(output))
+	}
+
+	// Then bring up the -cx interface
+	bringUpCxCmd := exec.CommandContext(ctx, "kubectl",
+		"exec", "-n", c.coreNamespace, podName,
+		"-c", nodeName,
+		"--", "ip", "link", "set", cxIfaceName, "up",
+	)
+	if output, err := bringUpCxCmd.CombinedOutput(); err != nil {
+		log.Debugf("Failed to bring up %s (may not exist yet): %v, output: %s", cxIfaceName, err, string(output))
+	}
+
+	return nil
+}
+
+// getPodNameForNode gets the pod name for a given SimNode
+func (c *CXRuntime) getPodNameForNode(ctx context.Context, nodeName string) (string, error) {
+	selector := fmt.Sprintf("cx-pod-name=%s", nodeName)
+	cmd := exec.CommandContext(ctx, "kubectl",
+		"get", "pods",
+		"-n", c.coreNamespace,
+		"-l", selector,
+		"-o", "jsonpath={.items[0].metadata.name}",
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get pod for node %s: %w", nodeName, err)
+	}
+
+	podName := strings.TrimSpace(string(output))
+	if podName == "" {
+		return "", fmt.Errorf("no pod found for node %s", nodeName)
+	}
+
+	return podName, nil
 }
