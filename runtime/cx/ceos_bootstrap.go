@@ -1,0 +1,320 @@
+// Copyright 2024 Nokia
+// Licensed under the BSD 3-Clause License.
+// SPDX-License-Identifier: BSD-3-Clause
+
+package cx
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/log"
+	"sigs.k8s.io/yaml"
+)
+
+// ceosIfWaitScript is the script that maintains network connectivity for cEOS containers.
+// It works around the issue where EOS systemd units reset Linux networking during boot,
+// causing the CNI routes to disappear.
+const ceosIfWaitScript = `#!/bin/bash
+set -euo pipefail
+
+log() {
+  echo "$(date -Iseconds) [if-wait] $*"
+}
+
+IFACE="${MGMT_INTF:-eth0}"
+READY_FLAG="/run/ceos-if-wait.ready"
+
+log "waiting for interface ${IFACE}"
+for _ in $(seq 1 60); do
+  if ip link show "$IFACE" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+get_pod_cidr() {
+  ip -o -4 addr show "$IFACE" 2>/dev/null | awk '{print $4; exit}'
+}
+
+POD_CIDR="$(get_pod_cidr)"
+ATTEMPTS=0
+while [ -z "$POD_CIDR" ] && [ $ATTEMPTS -lt 30 ]; do
+  sleep 1
+  POD_CIDR="$(get_pod_cidr)"
+  ATTEMPTS=$((ATTEMPTS+1))
+done
+
+if [ -n "$POD_CIDR" ]; then
+  POD_IP="${POD_CIDR%/*}"
+  POD_PREFIX="${POD_CIDR#*/}"
+else
+  POD_IP="${POD_IP:-}"
+  POD_PREFIX="${POD_PREFIX:-24}"
+  POD_CIDR="${POD_IP}/${POD_PREFIX}"
+fi
+
+mapfile -t ORIG_ROUTES < <(ip route show table main)
+
+POD_GW="$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')"
+if [ -z "$POD_GW" ]; then
+  POD_GW="${POD_GATEWAY:-}"
+fi
+
+apply_routes() {
+  if [ ${#ORIG_ROUTES[@]} -gt 0 ]; then
+    for entry in "${ORIG_ROUTES[@]}"; do
+      ip route replace $entry || true
+    done
+  fi
+}
+
+apply_net() {
+  if [ -n "$POD_CIDR" ]; then
+    log "ensuring ${IFACE} has ${POD_CIDR}"
+    ip addr replace "$POD_CIDR" dev "$IFACE"
+  fi
+  sysctl -w "net.ipv4.conf.${IFACE}.arp_ignore=0" >/dev/null
+  sysctl -w "net.ipv4.conf.${IFACE}.rp_filter=0" >/dev/null
+  sysctl -w "net.ipv4.conf.${IFACE}.accept_local=1" >/dev/null
+  apply_routes
+}
+
+apply_net
+touch "$READY_FLAG"
+
+while true; do
+  sleep 5
+  ip -o -4 addr show "$IFACE" | grep -q "$POD_CIDR" || apply_net
+done
+`
+
+// ceosCommand is the command used to start cEOS with the if-wait helper
+const ceosCommand = `bash -c 'rm -f /run/ceos-if-wait.ready; setsid /mnt/flash/if-wait.sh >/var/log/if-wait.log 2>&1 & while [ ! -f /run/ceos-if-wait.ready ]; do sleep 1; done; exec /sbin/init systemd.setenv=CEOS=1 systemd.setenv=EOS_PLATFORM=ceoslab systemd.setenv=container=docker systemd.setenv=ETBA=1 systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1 systemd.setenv=INTFTYPE=eth systemd.setenv=MAPETH0=1 systemd.setenv=MGMT_INTF=eth0'`
+
+// ceosEnvVars are the environment variables needed for cEOS
+var ceosEnvVars = map[string]string{
+	"CEOS":                              "1",
+	"EOS_PLATFORM":                      "ceoslab",
+	"container":                         "docker",
+	"ETBA":                              "1",
+	"SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT": "1",
+	"INTFTYPE":                          "eth",
+	"MAPETH0":                           "1",
+	"MGMT_INTF":                         "eth0",
+}
+
+// IsCeosImage checks if the given image is a cEOS image
+func IsCeosImage(image string) bool {
+	imageLower := strings.ToLower(image)
+	return strings.Contains(imageLower, "ceos") ||
+		strings.Contains(imageLower, "arista")
+}
+
+// BootstrapCeos performs the necessary setup for cEOS containers in EDA.
+// This includes:
+// 1. Creating the if-wait ConfigMap
+// 2. Patching the deployment with the proper command, volumes, and env vars
+// 3. Waiting for the pod to be ready
+// 4. Configuring admin credentials
+func (c *CXRuntime) BootstrapCeos(ctx context.Context, simNodeName string) error {
+	log.Infof("Bootstrapping cEOS for SimNode %s", simNodeName)
+
+	deploymentName := fmt.Sprintf("cx-eda--%s-sim", simNodeName)
+
+	// Step 1: Ensure the if-wait ConfigMap exists
+	if err := c.ensureCeosConfigMap(ctx); err != nil {
+		return fmt.Errorf("failed to create cEOS ConfigMap: %w", err)
+	}
+
+	// Step 2: Patch the deployment
+	if err := c.patchCeosDeployment(ctx, deploymentName, simNodeName); err != nil {
+		return fmt.Errorf("failed to patch cEOS deployment: %w", err)
+	}
+
+	// Step 3: Wait for rollout
+	if err := c.waitForDeploymentRollout(ctx, deploymentName); err != nil {
+		return fmt.Errorf("failed to wait for deployment rollout: %w", err)
+	}
+
+	// Step 4: Configure admin credentials
+	if err := c.configureCeosAdmin(ctx, simNodeName); err != nil {
+		return fmt.Errorf("failed to configure cEOS admin: %w", err)
+	}
+
+	log.Infof("cEOS bootstrap completed for %s", simNodeName)
+	return nil
+}
+
+func (c *CXRuntime) ensureCeosConfigMap(ctx context.Context) error {
+	log.Debug("Ensuring cEOS if-wait ConfigMap exists")
+
+	configMap := map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "ceos-if-wait",
+			"namespace": c.coreNamespace,
+		},
+		"data": map[string]interface{}{
+			"if-wait.sh": ceosIfWaitScript,
+		},
+	}
+
+	manifest, err := yaml.Marshal(configMap)
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
+	cmd.Stdin = bytes.NewReader(manifest)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to apply ConfigMap: %w, output: %s", err, string(output))
+	}
+
+	log.Debugf("ConfigMap apply output: %s", string(output))
+	return nil
+}
+
+func (c *CXRuntime) patchCeosDeployment(ctx context.Context, deploymentName, containerName string) error {
+	log.Debugf("Patching cEOS deployment %s", deploymentName)
+
+	// Check if volume already exists
+	checkVolumeCmd := exec.CommandContext(ctx, "kubectl",
+		"get", "deployment", deploymentName,
+		"-n", c.coreNamespace,
+		"-o", "jsonpath={range .spec.template.spec.volumes[*]}{.name} {end}",
+	)
+	volumeOutput, _ := checkVolumeCmd.Output()
+	hasVolume := strings.Contains(string(volumeOutput), "ceos-if-wait")
+
+	// Add volume if not present
+	if !hasVolume {
+		volumePatch := `[{"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"ceos-if-wait","configMap":{"name":"ceos-if-wait","defaultMode":493}}}]`
+		if err := c.patchDeployment(ctx, deploymentName, volumePatch); err != nil {
+			return fmt.Errorf("failed to add volume: %w", err)
+		}
+	}
+
+	// Check if volume mount already exists
+	checkMountCmd := exec.CommandContext(ctx, "kubectl",
+		"get", "deployment", deploymentName,
+		"-n", c.coreNamespace,
+		"-o", fmt.Sprintf("jsonpath={range .spec.template.spec.containers[?(@.name==\"%s\")].volumeMounts[*]}{.name} {end}", containerName),
+	)
+	mountOutput, _ := checkMountCmd.Output()
+	hasMount := strings.Contains(string(mountOutput), "ceos-if-wait")
+
+	// Add volume mount if not present
+	if !hasMount {
+		mountPatch := `[{"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"ceos-if-wait","mountPath":"/mnt/flash/if-wait.sh","subPath":"if-wait.sh"}}]`
+		if err := c.patchDeployment(ctx, deploymentName, mountPatch); err != nil {
+			return fmt.Errorf("failed to add volume mount: %w", err)
+		}
+	}
+
+	// Set the command
+	commandPatch := fmt.Sprintf(`[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["bash","-c","rm -f /run/ceos-if-wait.ready; setsid /mnt/flash/if-wait.sh >/var/log/if-wait.log 2>&1 & while [ ! -f /run/ceos-if-wait.ready ]; do sleep 1; done; exec /sbin/init systemd.setenv=CEOS=1 systemd.setenv=EOS_PLATFORM=ceoslab systemd.setenv=container=docker systemd.setenv=ETBA=1 systemd.setenv=SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT=1 systemd.setenv=INTFTYPE=eth systemd.setenv=MAPETH0=1 systemd.setenv=MGMT_INTF=eth0"]}]`)
+	if err := c.patchDeployment(ctx, deploymentName, commandPatch); err != nil {
+		return fmt.Errorf("failed to set command: %w", err)
+	}
+
+	// Set environment variables
+	envArgs := []string{
+		"set", "env", "deployment", deploymentName,
+		"-n", c.coreNamespace,
+		fmt.Sprintf("--containers=%s", containerName),
+		"--overwrite",
+	}
+	for k, v := range ceosEnvVars {
+		envArgs = append(envArgs, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	envCmd := exec.CommandContext(ctx, "kubectl", envArgs...)
+	if output, err := envCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to set env vars: %w, output: %s", err, string(output))
+	}
+
+	return nil
+}
+
+func (c *CXRuntime) patchDeployment(ctx context.Context, deploymentName, patch string) error {
+	cmd := exec.CommandContext(ctx, "kubectl",
+		"patch", "deployment", deploymentName,
+		"-n", c.coreNamespace,
+		"--type=json",
+		"-p", patch,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("patch failed: %w, output: %s", err, string(output))
+	}
+
+	log.Debugf("Patch output: %s", string(output))
+	return nil
+}
+
+func (c *CXRuntime) waitForDeploymentRollout(ctx context.Context, deploymentName string) error {
+	log.Debugf("Waiting for deployment %s rollout", deploymentName)
+
+	cmd := exec.CommandContext(ctx, "kubectl",
+		"rollout", "status", "deployment", deploymentName,
+		"-n", c.coreNamespace,
+		"--timeout=300s",
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("rollout status failed: %w, output: %s", err, string(output))
+	}
+
+	log.Debugf("Rollout status: %s", string(output))
+	return nil
+}
+
+func (c *CXRuntime) configureCeosAdmin(ctx context.Context, simNodeName string) error {
+	log.Debugf("Configuring admin credentials for %s", simNodeName)
+
+	podName, err := c.getPodName(ctx, simNodeName)
+	if err != nil {
+		return err
+	}
+
+	// Wait for EOS to be ready and configure admin
+	fastCliConfig := `enable
+configure terminal
+username admin privilege 15 secret admin
+management ssh
+end
+write memory
+`
+
+	deadline := time.Now().Add(150 * time.Second)
+	for time.Now().Before(deadline) {
+		cmd := exec.CommandContext(ctx, "kubectl",
+			"-n", c.coreNamespace,
+			"exec", podName,
+			"-c", simNodeName,
+			"--",
+			"bash", "-lc", fmt.Sprintf("FastCli -p 15 <<'__FCLI__'\n%s__FCLI__\n", fastCliConfig),
+		)
+
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Debugf("FastCli output: %s", string(output))
+			return nil
+		}
+
+		log.Debugf("FastCli attempt failed (retrying): %v, output: %s", err, string(output))
+		time.Sleep(10 * time.Second)
+	}
+
+	return fmt.Errorf("timed out configuring cEOS admin credentials")
+}
